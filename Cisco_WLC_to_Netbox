@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import logging
+import argparse
+import re
+import time
+import paramiko
+import csv
+from io import StringIO
+from pynetbox import api
+from pynetbox.core.query import RequestError
+from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Disable SSL warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def find_site_by_facility_id(nb, facility_id):
+    """
+    Find a site in Netbox with facility_id - don't create if not found
+    """
+    try:
+        # Try to find site by facility_id - convert RecordSet to list first
+        sites = list(nb.dcim.sites.filter(facility=facility_id))
+        if sites and len(sites) > 0:
+            logger.info(f"Found existing site by facility_id {facility_id}: {sites[0].name}")
+            return sites[0]
+        
+        # If not found by facility ID, log a warning
+        logger.warning(f"No site found with facility_id {facility_id}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error finding site with facility_id {facility_id}: {str(e)}")
+        return None
+
+
+def sanitize_slug(text):
+    """
+    Sanitize a string to create a valid Netbox slug
+    - Convert to lowercase
+    - Replace spaces with hyphens
+    - Remove any characters that aren't letters, numbers, underscores, or hyphens
+    """
+    # Convert to lowercase and replace spaces with hyphens
+    slug = text.lower().replace(" ", "-")
+    # Remove any characters that aren't allowed
+    slug = re.sub(r'[^a-z0-9_-]', '', slug)
+    # Ensure slug isn't empty and doesn't start/end with hyphens
+    slug = slug.strip('-')
+    if not slug:
+        slug = "cisco-wlc"  # Default if nothing valid remains
+    return slug
+
+def truncate_name(name, max_length=64):
+    """
+    Truncate a name to ensure it doesn't exceed max_length characters
+    """
+    if '.' in name:
+        name = name.split('.')[0]
+        logger.debug(f"Removed decimal portion, new name: {name}")
+    
+    if len(name) > max_length:
+        logger.warning(f"Name '{name}' exceeds {max_length} characters, truncating")
+        name = name[:max_length]
+    
+    return name
+
+def extract_facility_id(ap_name):
+    """
+    Extract facility ID from AP name:
+    - APN-008-01 → facility ID 8
+    - APN-081-03 → facility ID 81
+    - Special cases APN-000-XXX, APN-LOODS-01, APN-INFRA-00 → facility ID 00
+    """
+    # Check for special cases first
+    if ap_name.startswith('APN-000-') or ap_name.startswith('APN-LOODS-') or ap_name.startswith('APN-INFRA-'):
+        return '00'
+    
+    # Regular pattern: APN-NNN-XX where NNN is the facility ID
+    match = re.match(r'^APN-0*(\d+)-', ap_name)
+    if match:
+        facility_id = match.group(1)
+        # Remove leading zeros but keep the actual value
+        facility_id = str(int(facility_id))
+        return facility_id
+    
+    # If no match, return None
+    return None
+
+def ssh_connect(hostname, username, password, port=22):
+    """
+    Establish SSH connection to the Cisco WLC
+    """
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname, port=port, username=username, password=password, timeout=10)
+        logger.info(f"Successfully connected to {hostname}")
+        return client
+    except Exception as e:
+        logger.error(f"Failed to connect to {hostname}: {str(e)}")
+        raise
+
+def execute_command(ssh_client, command, timeout=30):
+    """
+    Execute a command via SSH and return the output, handling '--More--' prompts
+    """
+    try:
+        logger.debug(f"Executing command: {command}")
+        
+        # Open a channel for interactive commands
+        channel = ssh_client.invoke_shell()
+        channel.settimeout(timeout)
+        
+        # Clear any initial data
+        if channel.recv_ready():
+            channel.recv(1024)
+        
+        # Send the command with newline
+        channel.send(command + '\n')
+        
+        # Wait for command to start executing
+        time.sleep(1)
+        
+        output = ""
+        # Buffer to detect the --More-- prompt
+        more_prompt = "--More--"
+        more_prompt_buf = ""
+        
+        # Read output until we're done
+        while True:
+            # Check if data is available
+            if channel.recv_ready():
+                # Receive a chunk of data
+                chunk = channel.recv(1024).decode('utf-8', errors='replace')
+                
+                # Check for --More-- prompt
+                if more_prompt in chunk:
+                    # Remove the --More-- prompt from output
+                    chunk = chunk.replace(more_prompt, '')
+                    # Send space to continue
+                    channel.send(' ')
+                    # Short pause to let CLI process the space
+                    time.sleep(0.2)
+                
+                # Add chunk to output
+                output += chunk
+                
+                # Reset timeout counter when we receive data
+                last_data_time = time.time()
+            else:
+                # No data available, check if we're done or just waiting
+                if time.time() - last_data_time > 3:  # 3 seconds without data means we're done
+                    break
+                time.sleep(0.1)  # Small sleep to prevent CPU spinning
+        
+        # Close the channel
+        channel.close()
+        
+        logger.debug(f"Command completed, got {len(output)} bytes of output")
+        return output
+    except Exception as e:
+        logger.error(f"Error executing command '{command}': {str(e)}")
+        raise
+
+def get_ap_details_from_wlc(host, username, password):
+    """
+    Get detailed information for all APs from the WLC using a single command
+    """
+    try:
+        # Connect to the WLC
+        ssh_client = ssh_connect(host, username, password)
+        
+        # Execute the command to get all AP details
+        logger.info("Retrieving AP details from WLC...")
+        output = execute_command(ssh_client, "show ap config general")
+        
+        # Close connection
+        ssh_client.close()
+        
+        # Parse the output to extract AP information
+        return parse_ap_config_general(output)
+    except Exception as e:
+        logger.error(f"Error getting AP details from WLC: {str(e)}")
+        raise
+
+def parse_ap_config_general(output):
+    """
+    Parse the output of 'show ap config general' command
+    """
+    aps = []
+    current_ap = None
+    
+    # Split output by lines
+    lines = output.splitlines()
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Check for AP name (start of a new AP section)
+        if line.startswith("Cisco AP Name"):
+            # If we were already processing an AP, add it to our list
+            if current_ap:
+                aps.append(current_ap)
+            
+            # Extract AP name and start a new AP record
+            ap_name = line.split(":", 1)[1].strip()
+            current_ap = {
+                'name': ap_name,
+                'model': None,
+                'ethernet_mac': None,
+                'radio_mac': None,
+                'ip_address': None,
+                'serial': None,
+                'facility_id': extract_facility_id(ap_name)
+            }
+        
+        # If we're currently processing an AP, extract its details
+        if current_ap:
+            # Extract AP model
+            if "AP Model" in line:
+                current_ap['model'] = line.split(":", 1)[1].strip()
+            
+            # Extract MAC address (primary MAC)
+            elif "MAC Address" in line and not line.startswith("PoE Power Injector MAC Address"):
+                current_ap['ethernet_mac'] = line.split(":", 1)[1].strip()
+            
+            # Extract IP address
+            elif line.startswith("IP Address") and not line.startswith("IP Address Configuration") and not line.startswith("IP Address Being Used"):
+                current_ap['ip_address'] = line.split(":", 1)[1].strip()
+                if current_ap['ip_address'] == "0.0.0.0":
+                    current_ap['ip_address'] = None  # Treat 0.0.0.0 as no IP
+            
+            # Extract Serial Number
+            elif "AP Serial Number" in line:
+                current_ap['serial'] = line.split(":", 1)[1].strip()
+    
+    # Add the last AP if there is one
+    if current_ap:
+        aps.append(current_ap)
+    
+    logger.info(f"Parsed {len(aps)} access points from WLC")
+    return aps
+
+def get_or_create_tag(nb, tag_name, tag_slug, tag_description):
+    """Get or create a tag in Netbox"""
+    # Try to find the tag first
+    try:
+        tag = nb.extras.tags.get(slug=tag_slug)
+        if tag:
+            logger.info(f"Found existing tag: {tag_slug}")
+            return tag
+    except Exception as e:
+        logger.debug(f"Error getting tag {tag_slug}: {str(e)}")
+    
+    # Create the tag if it doesn't exist
+    logger.info(f"Creating new tag: {tag_slug}")
+    return nb.extras.tags.create(
+        name=tag_name,
+        slug=tag_slug,
+        description=tag_description
+    )
+
+def get_or_create_device_type(nb, model, manufacturer_name, tags):
+    """Get or create a device type in Netbox"""
+    try:
+        device_type = nb.dcim.device_types.get(model=model)
+        if device_type:
+            return device_type
+    except Exception as e:
+        logger.debug(f"Error getting device type {model}: {str(e)}")
+    
+    # Get or create manufacturer
+    try:
+        manufacturer = nb.dcim.manufacturers.get(name=manufacturer_name)
+        if not manufacturer:
+            manufacturer = nb.dcim.manufacturers.create(
+                name=manufacturer_name,
+                slug=sanitize_slug(manufacturer_name),
+                description=f'Created by Cisco WLC sync script'
+            )
+        manufacturer_id = manufacturer.id
+    except Exception as e:
+        logger.debug(f"Error getting manufacturer {manufacturer_name}: {str(e)}")
+        manufacturer = nb.dcim.manufacturers.create(
+            name=manufacturer_name,
+            slug=sanitize_slug(manufacturer_name),
+            description=f'Created by Cisco WLC sync script'
+        )
+        manufacturer_id = manufacturer.id
+    
+    # Create device type with a slug based on the model name
+    model_slug = sanitize_slug(model)
+    return nb.dcim.device_types.create(
+        model=model,
+        manufacturer=manufacturer_id,
+        slug=model_slug,
+        tags=tags
+    )
+
+def get_or_create_device_role(nb, name, tags):
+    """Get or create a device role in Netbox"""
+    try:
+        role = nb.dcim.device_roles.get(name=name)
+        if role:
+            return role
+    except Exception as e:
+        logger.debug(f"Error getting device role {name}: {str(e)}")
+    
+    return nb.dcim.device_roles.create(
+        name=name,
+        slug=sanitize_slug(name),
+        vm_role=False,
+        tags=tags
+    )
+
+def get_or_create_site(nb, name, facility_id, description, tags):
+    """Get or create a site in Netbox with facility_id"""
+    # First try exact matches
+    try:
+        # Try to find site by facility_id first
+        sites = nb.dcim.sites.filter(facility=facility_id)
+        if sites and len(sites) > 0:
+            logger.info(f"Found existing site by facility_id {facility_id}: {sites[0].name}")
+            return sites[0]
+        
+        # Try by exact name
+        site = nb.dcim.sites.get(name=name)
+        if site:
+            logger.info(f"Found existing site by name: {name}")
+            # Update facility_id if needed
+            if site.facility != facility_id:
+                site.facility = facility_id
+                site.save()
+                logger.info(f"Updated facility_id for site {name} to {facility_id}")
+            return site
+        
+        # Try by slug as a fallback
+        slug = sanitize_slug(name)
+        site = nb.dcim.sites.get(slug=slug)
+        if site:
+            logger.info(f"Found existing site by slug: {slug}")
+            # Update facility_id if needed
+            if site.facility != facility_id:
+                site.facility = facility_id
+                site.save()
+                logger.info(f"Updated facility_id for site {site.name} to {facility_id}")
+            return site
+        
+        # Try with case-insensitive name search (using API filtering)
+        sites = nb.dcim.sites.filter(name__ic=name)
+        if sites and len(sites) > 0:
+            logger.info(f"Found existing site by case-insensitive name: {sites[0].name}")
+            # Update facility_id if needed
+            if sites[0].facility != facility_id:
+                sites[0].facility = facility_id
+                sites[0].save()
+                logger.info(f"Updated facility_id for site {sites[0].name} to {facility_id}")
+            return sites[0]
+    except Exception as e:
+        logger.debug(f"Error getting site {name}: {str(e)}")
+    
+    # If site wasn't found, create a new one
+    logger.info(f"Creating new site: {name} with facility_id {facility_id}")
+    try:
+        return nb.dcim.sites.create(
+            name=name,
+            status='active',
+            slug=sanitize_slug(name),
+            facility=facility_id,
+            description=description,
+            tags=tags
+        )
+    except RequestError as e:
+        # If site already exists (common error), try to find and return it
+        if "site with this name already exists" in str(e) or "site with this slug already exists" in str(e):
+            logger.warning(f"Site creation failed because site already exists. Trying to retrieve existing site.")
+            
+            # Try by exact name again
+            try:
+                site = nb.dcim.sites.get(name=name)
+                if site:
+                    logger.info(f"Retrieved existing site by name: {name}")
+                    return site
+            except Exception as inner_e:
+                logger.debug(f"Error retrieving site by name after creation failure: {str(inner_e)}")
+            
+        # If it's a different error, re-raise it
+        raise
+
+def get_or_create_ip_address(nb, ip_address, description, tags, interface_id=None):
+    """Get or create an IP address in Netbox"""
+    # Ensure it has CIDR notation
+    if '/' not in ip_address:
+        cidr = f"{ip_address}/32"
+    else:
+        cidr = ip_address
+    
+    # Extract just the IP part without the subnet mask
+    ip_only = cidr.split('/')[0]
+    
+    try:
+        # First try exact match with the CIDR
+        ip = nb.ipam.ip_addresses.get(address=cidr)
+        if ip:
+            logger.info(f"Found existing IP address: {cidr}")
+            
+            # Update interface assignment if needed
+            if interface_id and (ip.assigned_object_id != interface_id or ip.assigned_object_type != 'dcim.interface'):
+                ip.assigned_object_id = interface_id
+                ip.assigned_object_type = 'dcim.interface'
+                ip.save()
+                logger.info(f"Updated interface assignment for IP: {cidr}")
+                
+            return ip
+    except Exception as e:
+        logger.debug(f"Error getting IP address {cidr}: {str(e)}")
+    
+    # If exact match fails, try to find IP by address only (without subnet mask)
+    try:
+        ips = list(nb.ipam.ip_addresses.filter(address__isw=ip_only))
+        if ips:
+            logger.info(f"Found existing IP address with different prefix: {ips[0].address}")
+            ip = ips[0]
+            
+            # Update interface assignment if needed
+            if interface_id and (ip.assigned_object_id != interface_id or ip.assigned_object_type != 'dcim.interface'):
+                ip.assigned_object_id = interface_id
+                ip.assigned_object_type = 'dcim.interface'
+                ip.save()
+                logger.info(f"Updated interface assignment for IP: {ip.address}")
+                
+            return ip
+    except Exception as e:
+        logger.debug(f"Error filtering IP address {ip_only}: {str(e)}")
+    
+    # Create new IP address if not found
+    try:
+        ip_data = {
+            'address': cidr,
+            'description': description,
+            'status': 'active',
+            'tags': tags
+        }
+        
+        if interface_id:
+            ip_data['assigned_object_type'] = 'dcim.interface'
+            ip_data['assigned_object_id'] = interface_id
+        
+        logger.info(f"Creating new IP address: {cidr}")
+        return nb.ipam.ip_addresses.create(**ip_data)
+    except RequestError as e:
+        # Handle duplicate IP address error
+        if "Duplicate IP address found in global table" in str(e):
+            logger.warning(f"Duplicate IP found when creating {cidr}. Trying to retrieve existing IP.")
+            
+            # The error message contains the existing IP with correct prefix
+            match = re.search(r'Duplicate IP address found in global table: ([\d\.]+/\d+)', str(e))
+            if match:
+                existing_cidr = match.group(1)
+                try:
+                    # Try to get the existing IP with the correct prefix
+                    ip = nb.ipam.ip_addresses.get(address=existing_cidr)
+                    if ip:
+                        logger.info(f"Retrieved existing IP: {existing_cidr}")
+                        
+                        # Update interface assignment if needed
+                        if interface_id and (ip.assigned_object_id != interface_id or ip.assigned_object_type != 'dcim.interface'):
+                            ip.assigned_object_id = interface_id
+                            ip.assigned_object_type = 'dcim.interface'
+                            ip.save()
+                            logger.info(f"Updated interface assignment for IP: {existing_cidr}")
+                            
+                        return ip
+                except Exception as inner_e:
+                    logger.debug(f"Error retrieving existing IP {existing_cidr}: {str(inner_e)}")
+            
+        # If we get here, re-raise the exception
+        logger.error(f"Error creating IP address {cidr}: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error creating IP address {cidr}: {str(e)}")
+        raise
+
+
+def sync_to_netbox(aps, netbox_url, netbox_token):
+    """Sync Cisco WLC access points to Netbox"""
+    logger.info(f"Syncing {len(aps)} access points to Netbox at {netbox_url}")
+    nb = api(netbox_url, token=netbox_token)
+    
+    # Disable SSL verification for Netbox
+    import requests
+    session = requests.Session()
+    session.verify = False
+    nb.http_session = session
+    
+    # Create a tag for WLC-synced objects
+    wlc_tag = get_or_create_tag(
+        nb,
+        tag_name="cisco-wlc-sync",
+        tag_slug="cisco-wlc-sync",
+        tag_description="Synced from Cisco WLC"
+    )
+    
+    # Create device role for AP
+    ap_role = get_or_create_device_role(
+        nb,
+        name="Access Point", 
+        tags=[wlc_tag.id]
+    )
+    
+    # Process each access point
+    for ap in tqdm(aps, desc="Syncing APs to Netbox"):
+        # Skip APs without a facility ID
+        if not ap['facility_id']:
+            logger.warning(f"Skipping AP {ap['name']} - could not determine facility ID")
+            continue
+        
+        # Find the site by facility ID
+        site = find_site_by_facility_id(nb, ap['facility_id'])
+        
+        # Skip if site not found
+        if not site:
+            logger.warning(f"Skipping AP {ap['name']} - no site found for facility ID {ap['facility_id']}")
+            continue
+        
+        # Clean up the model name
+        model = ap['model'].strip()
+        
+        # Get or create device type
+        device_type = get_or_create_device_type(
+            nb,
+            model=model,
+            manufacturer_name="Cisco",
+            tags=[wlc_tag.id]
+        )
+        
+        # Truncate name if needed
+        device_name = truncate_name(ap['name'])
+        
+        # Truncate name if needed
+        device_name = truncate_name(ap['name'])
+        
+        # Create device description with WLC data
+        device_description = (
+            f"Cisco WLC Access Point\n"
+            f"Model: {model}\n"
+            f"Ethernet MAC: {ap['ethernet_mac']}\n"
+            f"Radio MAC: {ap['radio_mac'] if ap['radio_mac'] else 'Unknown'}\n"
+            f"IP: {ap['ip_address'] if ap['ip_address'] else 'Unknown'}\n"
+            f"Serial: {ap['serial'] if ap['serial'] else 'Unknown'}"
+        )
+        logger.info(f"Device description: {device_description}")
+        
+        # Try to get existing device
+        try:
+            # First try by serial number if available
+            if ap['serial']:
+                nb_device = nb.dcim.devices.get(serial=ap['serial'])
+                if nb_device:
+                    logger.info(f"Found existing device by serial: {ap['serial']}")
+                    
+                    # Update device with new information
+                    update_needed = False
+                    if nb_device.device_type.id != device_type.id:
+                        nb_device.device_type = device_type.id
+                        update_needed = True
+                    if nb_device.role.id != ap_role.id:
+                        nb_device.role = ap_role.id
+                        update_needed = True
+                    if nb_device.name != device_name:
+                        nb_device.name = device_name
+                        update_needed = True
+                    
+                    if update_needed:
+                        nb_device.save()
+                        logger.info(f"Updated device: {device_name}")
+                else:
+                    # Try by name and site
+                    nb_device = nb.dcim.devices.get(name=device_name, site_id=site.id)
+                    if nb_device:
+                        logger.info(f"Found existing device by name and site: {device_name}")
+                        # Update serial if it doesn't match
+                        if nb_device.serial != ap['serial']:
+                            nb_device.serial = ap['serial']
+                            nb_device.save()
+                            logger.info(f"Updated serial for device: {device_name}")
+                    else:
+                        # Create new device
+                        nb_device = nb.dcim.devices.create(
+                            name=device_name,
+                            device_type=device_type.id,
+                            role=ap_role.id,
+                            site=site.id,
+                            status='active',
+                            tags=[wlc_tag.id],
+                            serial=ap['serial'],
+                            description=device_description
+                        )
+                        logger.info(f"Created new device: {device_name}")
+            else:
+                # No serial number, try by name and site
+                nb_device = nb.dcim.devices.get(name=device_name, site_id=site.id)
+                if nb_device:
+                    logger.info(f"Found existing device by name and site: {device_name}")
+                else:
+                    # Create new device
+                    nb_device = nb.dcim.devices.create(
+                        name=device_name,
+                        device_type=device_type.id,
+                        role=ap_role.id,
+                        site=site.id,
+                        status='active',
+                        tags=[wlc_tag.id],
+                        description=device_description
+                    )
+                    logger.info(f"Created new device: {device_name}")
+        except RequestError as e:
+            # Handle the case where device name already exists in the site
+            if "Device name must be unique per site" in str(e):
+                # Instead of creating a new device, find and update the existing one
+                try:
+                    # Find the existing device by name and site
+                    existing_device = nb.dcim.devices.get(name=device_name, site_id=site.id)
+                    if existing_device:
+                        logger.info(f"Found existing device with name {device_name} in site {site.name}. Updating instead of creating new.")
+                        
+                        # Update device with new information
+                        update_needed = False
+                        if existing_device.device_type.id != device_type.id:
+                            existing_device.device_type = device_type.id
+                            update_needed = True
+                        if existing_device.role.id != ap_role.id:
+                            existing_device.role = ap_role.id
+                            update_needed = True
+                        # Update serial if provided and different
+                        if ap['serial'] and existing_device.serial != ap['serial']:
+                            existing_device.serial = ap['serial']
+                            update_needed = True
+                        # Update description
+                        if existing_device.description != device_description:
+                            existing_device.description = device_description
+                            update_needed = True
+                        
+                        if update_needed:
+                            existing_device.save()
+                            logger.info(f"Updated existing device: {device_name}")
+                        
+                        nb_device = existing_device
+                    else:
+                        # This is unexpected - we got a name conflict but can't find the device
+                        logger.error(f"Couldn't find device with name {device_name} in site {site.name} despite name conflict")
+                        raise
+                except Exception as inner_e:
+                    logger.error(f"Error finding/updating existing device {device_name}: {str(inner_e)}")
+                    raise
+            else:
+                # Re-raise if it's a different error
+                raise
+        
+        # Create management interface if it doesn't exist
+        interface_name = "Management"
+        try:
+            interface = nb.dcim.interfaces.get(device_id=nb_device.id, name=interface_name)
+            if not interface:
+                interface = nb.dcim.interfaces.create(
+                    device=nb_device.id,
+                    name=interface_name,
+                    type="1000base-t",
+                    mac_address=ap['ethernet_mac'],
+                    tags=[wlc_tag.id]
+                )
+                logger.info(f"Created interface {interface_name} for device {device_name}")
+            else:
+                # Update MAC address if needed
+                if interface.mac_address != ap['ethernet_mac']:
+                    interface.mac_address = ap['ethernet_mac']
+                    interface.save()
+                    logger.info(f"Updated MAC address for interface {interface_name} of device {device_name}")
+        except Exception as e:
+            logger.debug(f"Error getting interface {interface_name} for device {device_name}: {str(e)}")
+            interface = nb.dcim.interfaces.create(
+                device=nb_device.id,
+                name=interface_name,
+                type="1000base-t",
+                mac_address=ap['ethernet_mac'],
+                tags=[wlc_tag.id]
+            )
+            logger.info(f"Created interface {interface_name} for device {device_name}")
+        
+        # Add IP address if available
+        if ap['ip_address']:
+            try:
+                ip_obj = get_or_create_ip_address(
+                    nb,
+                    ip_address=ap['ip_address'],
+                    description=f"Management IP for {device_name}",
+                    tags=[wlc_tag.id],
+                    interface_id=interface.id
+                )
+                
+                # Set as primary IP for the device
+                if ip_obj:
+                    try:
+                        # Update the device with this as primary IPv4
+                        nb_device.primary_ip4 = ip_obj.id
+                        nb_device.save()
+                        logger.info(f"Set {ip_obj.address} as primary IP for device {device_name}")
+                    except Exception as e:
+                        logger.error(f"Error setting primary IP for device {device_name}: {str(e)}")
+                        
+            except Exception as e:
+                logger.error(f"Error creating IP address {ap['ip_address']} for {device_name}: {str(e)}")
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Sync Cisco WLC access points to Netbox')
+    parser.add_argument('--wlc-host', help='Cisco WLC hostname/IP', default=os.environ.get('WLC_HOST'))
+    parser.add_argument('--wlc-username', help='Cisco WLC username', default=os.environ.get('WLC_USERNAME'))
+    parser.add_argument('--wlc-password', help='Cisco WLC password', default=os.environ.get('WLC_PASSWORD'))
+    parser.add_argument('--netbox-url', help='Netbox URL', default=os.environ.get('NETBOX_URL'))
+    parser.add_argument('--netbox-token', help='Netbox API token', default=os.environ.get('NETBOX_TOKEN'))
+    return parser.parse_args()
+
+def main():
+    """Main function to orchestrate the Cisco WLC to Netbox sync"""
+    args = parse_arguments()
+    
+    # Validate WLC parameters
+    if not args.wlc_username or not args.wlc_password:
+        logger.error("WLC username and password must be provided either as arguments or environment variables")
+        sys.exit(1)
+    
+    # Validate Netbox parameters
+    if not args.netbox_url or not args.netbox_token:
+        logger.error("Netbox URL and token must be provided either as arguments or environment variables")
+        sys.exit(1)
+    
+    try:
+        logger.info("Starting Cisco WLC to Netbox sync")
+        
+        # Get AP details from WLC (all in one command)
+        aps = get_ap_details_from_wlc(args.wlc_host, args.wlc_username, args.wlc_password)
+        
+        # Sync to Netbox
+        sync_to_netbox(aps, args.netbox_url, args.netbox_token)
+        
+        logger.info("Cisco WLC to Netbox sync completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Error during Cisco WLC to Netbox sync: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
